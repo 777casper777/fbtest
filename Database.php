@@ -5,10 +5,10 @@ namespace FpDbTest;
 use Exception;
 use mysqli;
 
-/*
 class Database implements DatabaseInterface
 {
     private mysqli $mysqli;
+    private const SKIP = '__SKIP__';
 
     public function __construct(mysqli $mysqli)
     {
@@ -17,119 +17,147 @@ class Database implements DatabaseInterface
 
     public function buildQuery(string $query, array $args = []): string
     {
-        throw new Exception();
-    }
+        $result = '';
+        $length = strlen($query);
+        $paramIndex = 0;
 
-    public function skip()
-    {
-        throw new Exception();
-    }
-}
-*/
-class Database implements DatabaseInterface
-{
-    public function buildQuery(string $template, array $params): string
-    {
-        // Обрабатываем условные блоки
-        $template = $this->processConditionBlocks($template, $params);
+        for ($i = 0; $i < $length; $i++) {
+            $char = $query[$i];
 
-        // Заменяем плейсхолдеры
-        $result = preg_replace_callback('/\?(d|f|a|#|)/', function ($matches) use (&$params) {
-            $type = $matches[1];
-            if (empty($params)) {
-                throw new Exception('Недостаточно параметров.');
+            if ($char === '?') {
+                $nextChar = $query[$i + 1] ?? null;
+                $value = $args[$paramIndex++] ?? null;
+
+                switch ($nextChar) {
+                    case 'd':
+                        $result .= $this->formatInt($value);
+                        $i++;
+                        break;
+                    case 'f':
+                        $result .= $this->formatFloat($value);
+                        $i++;
+                        break;
+                    case 'a':
+                        $result .= $this->formatArray($value);
+                        $i++;
+                        break;
+                    case '#':
+                        $result .= $this->formatIdentifier($value);
+                        $i++;
+                        break;
+                    default:
+                        $result .= $this->formatValue($value);
+                        break;
+                }
+            } elseif ($char === '{') {
+                $endBlock = strpos($query, '}', $i);
+                if ($endBlock === false) {
+                    throw new Exception("Unmatched '{' in template.");
+                }
+                $blockContent = substr($query, $i + 1, $endBlock - $i - 1);
+                $blockParams = array_slice($args, $paramIndex, substr_count($blockContent, '?'));
+
+                if (!in_array(self::SKIP, $blockParams, true)) {
+                    $result .= $this->buildQuery($blockContent, $blockParams);
+                }
+
+                $paramIndex += count($blockParams);
+                $i = $endBlock;
+            } else {
+                $result .= $char;
             }
-            $value = array_shift($params);
-            return $this->formatValue($value, $type);
-        }, $template);
-
-        // Проверяем наличие лишних параметров
-        if (!empty($params)) {
-            throw new Exception('Слишком много параметров.');
         }
 
         return $result;
     }
 
-    private function formatValue($value, $type)
+    public function skip()
+    {
+        return self::SKIP;
+    }
+
+    private function formatInt($value): string
     {
         if (is_null($value)) {
             return 'NULL';
         }
 
-        switch ($type) {
-            case 'd':
-                return intval($value);
-            case 'f':
-                return floatval($value);
-            case 'a':
-                if (!is_array($value)) {
-                    throw new Exception('Параметр не является массивом.');
-                }
-                return $this->formatArray($value);
-            case '#':
-                return is_array($value) ? $this->formatArray($value, true) : $this->escapeIdentifier($value);
-            default:
-                return $this->escapeValue($value);
+        if (is_bool($value)) {
+            $value = (int)$value;
         }
-    }
 
-    private function formatArray(array $array, $isIdentifier = false)
-    {
-        $result = [];
-        foreach ($array as $key => $value) {
-            if ($isIdentifier) {
-                $result[] = $this->escapeIdentifier($value);
-            } else {
-                $result[] = is_string($key)
-                    ? $this->escapeIdentifier($key) . ' = ' . $this->escapeValue($value)
-                    : $this->escapeValue($value);
-            }
+        if (is_int($value)) {
+            return (string)$value;
         }
-        return implode(', ', $result);
-    }
 
-    private function escapeValue($value)
-    {
-        if (is_int($value) || is_float($value)) {
+        if (is_string($value) && ctype_digit($value)) {
             return $value;
+        }
+
+        throw new Exception("Value must be an integer or a string of digits.");
+    }
+
+
+    private function formatFloat($value): string
+    {
+        if (is_null($value)) {
+            return 'NULL';
+        }
+        if (!is_float($value) && !is_numeric($value)) {
+            throw new Exception("Value must be a float.");
+        }
+        return (string)(float)$value;
+    }
+
+    private function formatArray($value): string
+    {
+        if (!is_array($value)) {
+            throw new Exception("Value must be an array.");
+        }
+        $formatted = [];
+        foreach ($value as $key => $val) {
+            if (is_string($key)) {
+                $formatted[] = $this->escapeIdentifier($key) . ' = ' . $this->formatValue($val);
+            } else {
+                $formatted[] = $this->formatValue($val);
+            }
+        }
+        return implode(', ', $formatted);
+    }
+
+    private function formatIdentifier($value): string
+    {
+        if (is_array($value)) {
+            return implode(', ', array_map([$this, 'escapeIdentifier'], $value));
+        }
+        return $this->escapeIdentifier($value);
+    }
+
+    private function formatValue($value): string
+    {
+        if (is_null($value)) {
+            return 'NULL';
+        } elseif (is_int($value) || is_float($value)) {
+            return (string)$value;
         } elseif (is_bool($value)) {
-            return $value ? 1 : 0;
+            return $value ? '1' : '0';
         } elseif (is_string($value)) {
-            return "'" . addslashes($value) . "'";
+            return "'" . $this->escapeString($value) . "'";
         } else {
-            throw new Exception('Неподдерживаемый тип параметра.');
+            throw new Exception("Unsupported value type.");
         }
     }
 
-    private function escapeIdentifier($value)
+    private function escapeString(string $value): string
     {
-        if (!is_string($value)) {
-            throw new Exception('Идентификатор должен быть строкой.');
+        return $this->mysqli->real_escape_string($value);
+    }
+
+    private function escapeIdentifier($value): string
+    {
+        if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $value)) {
+            throw new Exception("Invalid identifier: $value");
         }
-        return '`' . str_replace('`', '``', $value) . '`';
-    }
-
-    private function processConditionBlocks(string $template, array $params): string
-    {
-        return preg_replace_callback('/{([^}]*)}/', function ($matches) use ($params) {
-            foreach ($params as $param) {
-                if ($param === $this->skip()) {
-                    return '';
-                }
-            }
-            return $matches[1];
-        }, $template);
-    }
-
-    public function skip()
-    {
-        return new class {
-            public function __toString()
-            {
-                return 'SKIP';
-            }
-        };
+        return "`$value`";
     }
 }
-
